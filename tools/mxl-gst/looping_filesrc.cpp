@@ -757,6 +757,8 @@ private:
                         // Generate the skipped samples as silenced samples.
                         // ** A production application should apply a fade when inserting silence to avoid audio artefacts
                         auto nbSamples = gstSampleIndex - *sampleIndex;
+                        // Limit the nbSamples, otherwise mxl throws errorcode 8, due to buffer mismatch
+                        // TODO the issue seems relate to the looping of the file, and timing
                         nbSamples = nbSamples > audioBatchSize ? audioBatchSize : nbSamples;
 
                         auto actualSampleIndex = *sampleIndex;
