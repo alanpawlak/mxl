@@ -46,6 +46,7 @@ class LoopingFilePlayer
 {
 public:
     constexpr static mxlRational defaultAudioGrainRate = mxlRational{48000, 1};
+    constexpr static std::uint64_t defaultAudioBatchSize = defaultAudioGrainRate.numerator / (100U * defaultAudioGrainRate.denominator);
 
     static void cb_pad_added(GstElement* element, GstPad* pad, gpointer data)
     {
@@ -467,23 +468,22 @@ public:
             // The pipeline is PAUSED and the appSinkAudio should have received its preroll buffer.
             // We can try to pull this preroll sample to inspect the first decoded audio buffer
             // Default to 10ms worth of samples
-            std::uint32_t batchSize = audioGrainRate.numerator / (100U * audioGrainRate.denominator);
             GstSample* sample = gst_app_sink_try_pull_preroll(GST_APP_SINK(appSinkAudio), 100'000'000);
             if (sample)
             {
                 GstBuffer* buffer = gst_sample_get_buffer(sample);
                 gsize size = gst_buffer_get_size(buffer);
-                batchSize = size / (sizeof(float) * audioChannels);
-                MXL_INFO("Initial audio buffer size: {} samples", batchSize);
+                audioBatchSize = size / (sizeof(float) * audioChannels);
+                MXL_INFO("Initial audio buffer size: {} samples", audioBatchSize);
                 gst_sample_unref(sample);
             }
             else
             {
-                MXL_WARN("No preroll sample received while pulling from appSinkAudio. Unable to determine batchSize.");
+                MXL_WARN("No preroll sample received while pulling from appSinkAudio. Unable to determine audioBatchSize.");
             }
 
             mxlFlowConfigInfo configInfo;
-            auto res = mxlCreateFlow(mxlInstance, flowDef.c_str(), getFlowOptions(batchSize, batchSize).c_str(), &configInfo);
+            auto res = mxlCreateFlow(mxlInstance, flowDef.c_str(), getFlowOptions(audioBatchSize, audioBatchSize).c_str(), &configInfo);
             if (res != MXL_STATUS_OK)
             {
                 MXL_ERROR("Failed to create flow: {}", (int)res);
@@ -655,7 +655,7 @@ private:
                     }
                     else if (grainIndex != lastVideoGrainIndex + 1)
                     {
-                        MXL_WARN("Video skipped grain index. Expected {}, got {}", lastVideoGrainIndex + 1, grainIndex);
+                        // MXL_WARN("Video skipped grain index. Expected {}, got {}", lastVideoGrainIndex + 1, grainIndex);
                     }
 
                     if (GST_CLOCK_TIME_IS_VALID(pts))
@@ -708,79 +708,144 @@ private:
 
     void audioThread()
     {
+        std::optional<std::uint64_t> sampleIndex;
+
         while (running)
         {
-            auto sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appSinkAudio), 100'000'000);
+            auto sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appSinkAudio), 200'000'000);
             if (sample)
             {
                 auto buffer = gst_sample_get_buffer(sample);
                 if (buffer)
                 {
-                    auto pts = GST_BUFFER_PTS(buffer);
+                    auto gstBufferPts = GST_BUFFER_PTS(buffer);
+
                     if (!audioAppSinkOffset)
                     {
-                        audioAppSinkOffset = mxlGetTime() - (pts + gstBaseTime);
+                        audioAppSinkOffset = mxlGetTime() - (gstBufferPts + gstBaseTime);
                         MXL_INFO("appSinkAudio: Set internal offset to {} ns", *audioAppSinkOffset);
                     }
 
-                    GST_BUFFER_PTS(buffer) = pts + gstBaseTime + *audioAppSinkOffset;
-                    auto grainIndex = mxlTimestampToIndex(&audioGrainRate, GST_BUFFER_PTS(buffer));
+                    auto adjGstBufferPts = gstBufferPts + gstBaseTime + *audioAppSinkOffset;
+                    GST_BUFFER_PTS(buffer) = adjGstBufferPts;
 
-                    lastAudioGrainIndex = grainIndex;
+                    auto gstSampleIndex = mxlTimestampToIndex(&defaultAudioGrainRate, adjGstBufferPts);
 
-                    if (lastAudioGrainIndex == 0)
+                    // First buffer, set the initial sample index
+                    if (!sampleIndex)
                     {
-                        lastAudioGrainIndex = grainIndex;
-                    }
-                    else if (grainIndex != lastAudioGrainIndex + 1)
-                    {
-                        MXL_WARN("Audio skipped grain index. Expected {}, got {}", lastAudioGrainIndex + 1, grainIndex);
+                        sampleIndex = gstSampleIndex;
+                        MXL_INFO("ContinuousFlow: Set initial sample index to {} (adjGstBufferPts={} ns)", *sampleIndex, adjGstBufferPts);
                     }
 
-                    GstMapInfo map_info;
-                    if (gst_buffer_map(buffer, &map_info, GST_MAP_READ))
+                    // Verify that we didnt miss any samples
+                    if (gstSampleIndex < *sampleIndex) // gstreamer index is smaller than we expected. time went backward??
                     {
-                        auto nbSamplesPerChan = map_info.size / (sizeof(float) * audioChannels);
+                        MXL_ERROR("Unexpected sample index from gstreamer PTS {} expected sample index {}. Time went backward??",
+                            gstSampleIndex,
+                            *sampleIndex);
+                    }
+                    else if (gstSampleIndex > *sampleIndex) // gstreamer index is bigger than we expected
+                    {
+                        MXL_WARN("ContinuousFlow: Skipped sample(s). Expected sample index {}, got sample index {} (gstGrainIndex={} ns). Generating "
+                                 "{} silenced samples",
+                            *sampleIndex,
+                            gstSampleIndex,
+                            gstBufferPts,
+                            gstSampleIndex - *sampleIndex);
+
+                        // Generate the skipped samples as silenced samples.
+                        // ** A production application should apply a fade when inserting silence to avoid audio artefacts
+                        auto nbSamples = gstSampleIndex - *sampleIndex;
+                        nbSamples = nbSamples > audioBatchSize ? audioBatchSize : nbSamples;
+
+                        auto actualSampleIndex = *sampleIndex;
 
                         mxlMutableWrappedMultiBufferSlice payloadBuffersSlices;
-                        if (mxlFlowWriterOpenSamples(flowWriterAudio, grainIndex, nbSamplesPerChan, &payloadBuffersSlices))
+                        if (mxlStatus error = mxlFlowWriterOpenSamples(flowWriterAudio, actualSampleIndex, nbSamples, &payloadBuffersSlices))
                         {
-                            MXL_ERROR("Failed to open samples at index '{}'", grainIndex);
+                            MXL_ERROR("Failed to open samples at index '{}', error {}", actualSampleIndex, static_cast<int>(error));
                             break;
                         }
 
-                        std::uintptr_t offset = 0;
                         for (uint64_t chan = 0; chan < payloadBuffersSlices.count; ++chan)
                         {
                             for (auto& fragment : payloadBuffersSlices.base.fragments)
                             {
-                                if (fragment.size > 0)
+                                if (fragment.size != 0)
                                 {
                                     auto dst = reinterpret_cast<std::uint8_t*>(fragment.pointer) + (chan * payloadBuffersSlices.stride);
-                                    auto src = map_info.data + offset;
-                                    ::memcpy(dst, src, fragment.size);
-                                    offset += fragment.size;
+                                    ::memset(dst, 0, fragment.size); // fill with silence
                                 }
                             }
                         }
 
                         if (mxlFlowWriterCommitSamples(flowWriterAudio) != MXL_STATUS_OK)
                         {
-                            MXL_ERROR("Failed to open samples at index '{}'", grainIndex);
+                            MXL_ERROR("Failed to open samples at index '{}'", actualSampleIndex);
                             break;
                         }
 
-                        gst_buffer_unmap(buffer, &map_info);
+                        *sampleIndex = gstSampleIndex;
                     }
+                    else
+                    {
+                        GstMapInfo map_info;
+                        if (gst_buffer_map(buffer, &map_info, GST_MAP_READ))
+                        {
+                            auto nbSamplesPerChan = map_info.size / (sizeof(float) * audioChannels);
+                            auto actualSampleIndex = *sampleIndex;
 
-                    auto ns = mxlGetNsUntilIndex(grainIndex, &audioGrainRate);
-                    mxlSleepForNs(ns);
+                            mxlMutableWrappedMultiBufferSlice payloadBuffersSlices;
+                            if (mxlFlowWriterOpenSamples(flowWriterAudio, actualSampleIndex, nbSamplesPerChan, &payloadBuffersSlices))
+                            {
+                                MXL_ERROR("Failed to open grain at index '{}'", actualSampleIndex);
+                                gst_buffer_unmap(buffer, &map_info);
+                                break;
+                            }
+
+                            std::uintptr_t offset = 0;
+                            for (uint64_t chan = 0; chan < payloadBuffersSlices.count; ++chan)
+                            {
+                                for (auto& fragment : payloadBuffersSlices.base.fragments)
+                                {
+                                    if (fragment.size > 0)
+                                    {
+                                        auto dst = reinterpret_cast<std::uint8_t*>(fragment.pointer) + (chan * payloadBuffersSlices.stride);
+                                        auto src = map_info.data + offset;
+                                        ::memcpy(dst, src, fragment.size);
+                                        offset += fragment.size;
+                                    }
+                                }
+                            }
+
+                            if (mxlFlowWriterCommitSamples(flowWriterAudio) != MXL_STATUS_OK)
+                            {
+                                MXL_ERROR("Failed to open samples at index '{}'", actualSampleIndex);
+                                gst_buffer_unmap(buffer, &map_info);
+                                break;
+                            }
+
+                            gst_buffer_unmap(buffer, &map_info);
+                            *sampleIndex += nbSamplesPerChan;
+                        }
+                    }
+                    mxlSleepForNs(mxlGetNsUntilIndex(*sampleIndex, &audioGrainRate));
                 }
                 gst_sample_unref(sample);
             }
             else
             {
-                MXL_WARN("No sample received while pulling from appsink");
+                if (gst_app_sink_is_eos(GST_APP_SINK(appSinkAudio)))
+                {
+                    MXL_INFO("appSinkAudio reached EOS");
+                    break; // or wait for your looping logic to restart
+                }
+                else
+                {
+                    MXL_WARN("No sample received from appsink within timeout");
+                    continue;
+                }
             }
         }
     }
@@ -817,8 +882,6 @@ private:
     ::GstElement* appSinkAudio = nullptr;
     // Keep a copy of the last video grain index
     uint64_t lastVideoGrainIndex = 0;
-    // Keep a copy of the last video grain index
-    uint64_t lastAudioGrainIndex = 0;
     // Running flag
     std::atomic<bool> running{false};
     // Current frame number
@@ -827,6 +890,8 @@ private:
     ::mxlRational videoGrainRate{0, 1};
     // The audio grain rate
     ::mxlRational audioGrainRate{defaultAudioGrainRate};
+    // The audio batch size
+    std::uint64_t audioBatchSize{defaultAudioBatchSize};
     // Audio channels
     std::uint32_t audioChannels = 0;
 };
