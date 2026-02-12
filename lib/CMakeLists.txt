@@ -117,11 +117,15 @@ write_basic_package_version_file(
         COMPATIBILITY SameMinorVersion
     )
 
+# Install the Findpicojson module (picojson is a dependency in ${PROJECT_NAME}-config)
+install(FILES
+            ${CMAKE_SOURCE_DIR}/cmake/modules/Findpicojson.cmake
+        DESTINATION ${MXL_CMAKE_CONFIG_DESTINATION}/modules)
+
 # Install the generated config and version files.
 install(FILES
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config-version.cmake
-            ${CMAKE_SOURCE_DIR}/cmake/modules/Findpicojson.cmake
         DESTINATION ${MXL_CMAKE_CONFIG_DESTINATION}
         COMPONENT ${PROJECT_NAME}-dev
     )
