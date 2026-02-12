@@ -121,6 +121,7 @@ write_basic_package_version_file(
 install(FILES
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake
             ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config-version.cmake
+            ${CMAKE_SOURCE_DIR}/cmake/modules/Findpicojson.cmake
         DESTINATION ${MXL_CMAKE_CONFIG_DESTINATION}
         COMPONENT ${PROJECT_NAME}-dev
     )
